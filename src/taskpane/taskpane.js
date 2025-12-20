@@ -215,12 +215,21 @@
   }
 
   // Match participants to team members (fuzzy match by name)
+  // IMPORTANT: Only LCMCommodities employees can be assignees
+  // External participants (non-lcmcommodities.com emails) are excluded
   function matchParticipantsToTeamMembers(participants) {
     const teamCheckboxes = Array.from(document.querySelectorAll('#assignees input[type=checkbox]'));
     const teamNames = teamCheckboxes.map(cb => cb.value.toLowerCase());
     const matched = [];
     
-    participants.forEach(p => {
+    // Filter to only LCMCommodities participants first
+    const lcmParticipants = participants.filter(p => {
+      if (!p.email) return false; // No email = can't verify, skip
+      const emailLower = p.email.toLowerCase();
+      return emailLower.endsWith('@lcmcommodities.com') || emailLower.endsWith('@lcmc.com');
+    });
+    
+    lcmParticipants.forEach(p => {
       const pNameLower = p.name.toLowerCase();
       // Try exact match first
       let idx = teamNames.findIndex(t => t === pNameLower);
