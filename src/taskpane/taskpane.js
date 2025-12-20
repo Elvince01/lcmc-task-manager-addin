@@ -9,14 +9,12 @@
   let teamMembersLoaded = false;
   let hasUnsavedChanges = false;
 
-  // Email Summarizer API configuration
-  // For development: http://localhost:5002
-  // For production: Update to your internal server URL (e.g., http://summarizer.lcmcommodities.com:5002)
-  const EMAIL_SUMMARIZER_API_URL = 'http://192.168.1.141:5002';
+  // SmartBrief Integration
+  // Email summaries are fetched by VBA macro (SmartBrief.bas) and written to column L
+  // The add-in reads from column L to display summaries (no direct API calls from JS)
 
-  // SmartBrief matching configuration
-  // Combined matching uses company name (60%) + date proximity (40%)
-  const SMARTBRIEF_MATCH_THRESHOLD = 0.5; // 0.0 to 1.0 (minimum combined score)
+  const EMAIL_SUMMARIZER_API_URL = 'http://192.168.1.141:5002';
+  const SMARTBRIEF_MATCH_THRESHOLD = 0.5;
 
   // Toast notification helper
   function showToast(message, type = 'success') {
@@ -156,6 +154,142 @@
     const indicator = qs('#unsavedIndicator');
     if (indicator) {
       indicator.classList.toggle('visible', unsaved);
+    }
+  }
+
+  // ============== SmartBrief Parsing Helpers ==============
+
+  // Parse participants from SmartBrief summary
+  // Format: "## PARTICIPANTS\n- Name (email@domain.com)\n- Name2 (email2@domain.com)"
+  function parseParticipantsFromSummary(summaryText) {
+    const participants = [];
+    const participantsMatch = summaryText.match(/## PARTICIPANTS\n([\s\S]*?)(?=\n## |$)/);
+    if (participantsMatch) {
+      const participantsBlock = participantsMatch[1];
+      const lines = participantsBlock.split('\n').filter(l => l.trim().startsWith('-'));
+      lines.forEach(line => {
+        // Parse "- Name (email@domain.com)" or "- Name"
+        const match = line.match(/^-\s*(.+?)(?:\s*\(([^)]+)\))?\s*$/);
+        if (match) {
+          const name = match[1].trim();
+          const email = match[2] ? match[2].trim() : '';
+          if (name) {
+            participants.push({ name, email });
+          }
+        }
+      });
+    }
+    return participants;
+  }
+
+  // Parse summary body from SmartBrief (the ## SUMMARY section)
+  function parseSummaryBodyFromSummary(summaryText) {
+    const summaryMatch = summaryText.match(/## SUMMARY\n([\s\S]*?)(?=\n## |$)/);
+    if (summaryMatch) {
+      return summaryMatch[1].trim();
+    }
+    // Fallback: return everything after the first line
+    const lines = summaryText.split('\n');
+    return lines.slice(1).join('\n').trim();
+  }
+
+  // Detect task category from summary text using keywords
+  function detectCategoryFromSummary(summaryText) {
+    const text = summaryText.toLowerCase();
+    
+    // Check for specific keywords
+    if (text.includes('onboarding') || text.includes('new client') || text.includes('new account') || text.includes('account opening')) {
+      return 'Onboarding';
+    }
+    if (text.includes('kyc') || text.includes('know your customer') || text.includes('compliance') || text.includes('documents') || text.includes('documentation')) {
+      return 'KYC update';
+    }
+    if (text.includes('rate') || text.includes('pricing') || text.includes('amendment') || text.includes('amended') || text.includes('fee') || text.includes('commission')) {
+      return 'Amended Product/Rate';
+    }
+    if (text.includes('give-up') || text.includes('giveup') || text.includes('give up')) {
+      return 'Give-up';
+    }
+    
+    return null; // No clear category detected
+  }
+
+  // Match participants to team members (fuzzy match by name)
+  function matchParticipantsToTeamMembers(participants) {
+    const teamCheckboxes = Array.from(document.querySelectorAll('#assignees input[type=checkbox]'));
+    const teamNames = teamCheckboxes.map(cb => cb.value.toLowerCase());
+    const matched = [];
+    
+    participants.forEach(p => {
+      const pNameLower = p.name.toLowerCase();
+      // Try exact match first
+      let idx = teamNames.findIndex(t => t === pNameLower);
+      // Try partial match (first name)
+      if (idx === -1) {
+        const firstName = pNameLower.split(' ')[0];
+        idx = teamNames.findIndex(t => t.startsWith(firstName) || t.includes(firstName));
+      }
+      // Try email prefix match
+      if (idx === -1 && p.email) {
+        const emailPrefix = p.email.split('@')[0].toLowerCase();
+        idx = teamNames.findIndex(t => {
+          const tFirstName = t.split(' ')[0];
+          return emailPrefix.includes(tFirstName) || tFirstName.includes(emailPrefix);
+        });
+      }
+      if (idx !== -1) {
+        matched.push(teamCheckboxes[idx].value);
+      }
+    });
+    
+    return [...new Set(matched)]; // dedupe
+  }
+
+  // Store parsed SmartBrief data for "Apply to Task" action
+  let lastParsedSmartBrief = null;
+
+  async function fetchSmartBriefSummaryFromApi(company, initialRequest, introEmail, remindersStart) {
+    const useLocalProxy = typeof window !== 'undefined'
+      && window.location
+      && window.location.hostname === 'localhost'
+      && window.location.protocol === 'https:';
+
+    const baseUrl = useLocalProxy ? '' : EMAIL_SUMMARIZER_API_URL;
+    const url = `${baseUrl}/api/task-manager/summaries/${encodeURIComponent(company)}`;
+
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          initial_request: initialRequest,
+          intro_email: introEmail,
+          reminders_start: remindersStart,
+          threshold: SMARTBRIEF_MATCH_THRESHOLD
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error(`Server returned ${response.status}`);
+      }
+
+      const data = await response.json();
+      const summaries = Array.isArray(data.summaries) ? data.summaries : [];
+      if (summaries.length === 0) return '';
+
+      const best = summaries[0] || {};
+      const subject = String(best.subject || 'No subject');
+      const summary = String(best.summary || '').trim();
+      const matchScore = typeof best.match_score === 'number' ? best.match_score : parseFloat(best.match_score);
+      const matchPercent = Number.isFinite(matchScore) ? Math.round(matchScore * 100) : 0;
+
+      if (!summary) return '';
+      return `[${matchPercent}% match] ${subject}\n\n${summary}`;
+    } catch (err) {
+      // Common failure modes: mixed content (https add-in calling http API) or CORS
+      const msg = err && err.message ? err.message : String(err);
+      showToast('SmartBrief API error: ' + msg, 'error');
+      return '';
     }
   }
 
@@ -2448,11 +2582,19 @@
     });
   }
 
-  // Load email summaries from the API
+  // Load email summaries from Column L (populated by VBA SmartBrief macro)
+  // The VBA macro calls the API and writes the summary to column L
+  // This function reads that pre-fetched summary and displays it
   async function loadEmailSummaries() {
     const company = companyNameInput ? companyNameInput.value.trim() : '';
     if (!company) {
       showToast('No company name entered', 'error');
+      return;
+    }
+
+    // Must have a valid row to read from
+    if (currentRowNum === null || currentRowNum === 'new') {
+      showToast('Please save the task first or select an existing row', 'error');
       return;
     }
 
@@ -2461,80 +2603,389 @@
       emailSummarySection.classList.add('visible');
     }
     if (emailSummaryList) {
-      emailSummaryList.innerHTML = '<div class="email-loading">Loading summaries...</div>';
+      emailSummaryList.innerHTML = '<div class="email-loading">Loading summary from spreadsheet...</div>';
     }
 
     try {
-      // Get task dates from form inputs for smart matching
-      const initialRequest = initialRequestInput ? initialRequestInput.value : '';
-      const introEmail = introEmailInput ? introEmailInput.value : '';
-      const remindersStart = remindersStartInput ? remindersStartInput.value : '';
+      // Read from Excel - extract data only, no DOM manipulation inside Excel.run
+      let summaryText = '';
+      await Excel.run(async (context) => {
+        const sheet = context.workbook.worksheets.getItemOrNullObject('TASK MANAGER FORM');
+        sheet.load('name');
+        await context.sync();
 
-      // Use POST with dates for combined company + date matching
-      const response = await fetch(
-        `${EMAIL_SUMMARIZER_API_URL}/api/task-manager/summaries/${encodeURIComponent(company)}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            initial_request: initialRequest,
-            intro_email: introEmail,
-            reminders_start: remindersStart,
-            threshold: SMARTBRIEF_MATCH_THRESHOLD
-          })
+        if (sheet.isNullObject) {
+          throw new Error('TASK MANAGER FORM sheet not found');
         }
-      );
 
-      if (!response.ok) {
-        throw new Error(`Server returned ${response.status}`);
+        // Read column L for the current row (SmartBrief summary)
+        const cell = sheet.getRange(`L${currentRowNum}`);
+        cell.load('values');
+        await context.sync();
+
+        summaryText = (cell.values && cell.values[0] && cell.values[0][0])
+          ? String(cell.values[0][0]).trim()
+          : '';
+      });
+
+      // Excel can store in-cell line breaks as "\r" on some platforms (not "\n");
+      // normalize so parsing + rendering works consistently.
+      if (summaryText) {
+        summaryText = summaryText.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
       }
 
-      const data = await response.json();
-      const summaries = data.summaries || [];
+      // If column L is empty, try to fetch from API (only works in localhost dev due to mixed-content)
+      // In production, VBA macro should have already populated column L
+      if (!summaryText) {
+        // Only attempt API call in localhost development (HTTPS add-in can't call HTTP API in production)
+        const isLocalhost = typeof window !== 'undefined' 
+          && window.location 
+          && window.location.hostname === 'localhost';
+        
+        if (isLocalhost) {
+          if (emailSummaryList) {
+            emailSummaryList.innerHTML = '<div class="email-loading">Fetching summary from API...</div>';
+          }
 
-      // Update count badge
+          const initialRequest = initialRequestInput ? String(initialRequestInput.value || '') : '';
+          const introEmail = introEmailInput ? String(introEmailInput.value || '') : '';
+          const remindersStart = remindersStartInput ? String(remindersStartInput.value || '') : '';
+
+          const apiSummary = await fetchSmartBriefSummaryFromApi(company, initialRequest, introEmail, remindersStart);
+          summaryText = apiSummary || '';
+
+          if (summaryText) {
+            summaryText = summaryText.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+          }
+
+          if (summaryText) {
+            await Excel.run(async (context) => {
+              const sheet = context.workbook.worksheets.getItemOrNullObject('TASK MANAGER FORM');
+              sheet.load('name');
+              await context.sync();
+
+              if (sheet.isNullObject) {
+                throw new Error('TASK MANAGER FORM sheet not found');
+              }
+
+              const cell = sheet.getRange(`L${currentRowNum}`);
+              cell.values = [[summaryText]];
+              await context.sync();
+            });
+          }
+        }
+      }
+
+      // Now do DOM updates outside of Excel.run
+      // Update count badge (1 if we have a summary, 0 if not)
       if (emailSummaryCount) {
-        emailSummaryCount.textContent = summaries.length;
+        emailSummaryCount.textContent = summaryText ? '1' : '0';
       }
 
-      // Render summaries - seamless display, no confirmation needed
-      if (summaries.length === 0) {
-        emailSummaryList.innerHTML = '<div class="email-no-summaries">No email summaries found for this company and timeframe.</div>';
+      // Display the summary
+      if (!summaryText) {
+        if (emailSummaryList) {
+          emailSummaryList.innerHTML = `
+            <div class="email-no-summaries">
+              No email summary found for this row.<br>
+              <small>Run the SmartBrief macro (Alt+F8 → SmartBrief) to fetch summaries.</small>
+            </div>`;
+        }
         return;
       }
 
-      emailSummaryList.innerHTML = summaries.map(s => {
-        // Calculate match quality indicator
-        const matchPercent = Math.round((s.match_score || 1) * 100);
-        const companyPercent = Math.round((s.company_score || 1) * 100);
-        const datePercent = Math.round((s.date_score || 0.5) * 100);
+      // Parse the summary text from VBA format:
+      // "[XX% match] Subject\n\nSummary text"
+      const lines = summaryText.split(/\n/);
+      const firstLine = (lines[0] || '').trim();
+      const restText = lines.slice(1).join('\n').replace(/^\n+/, '').trim();
 
-        // Color code by match quality
-        let matchClass = 'match-high';
-        if (matchPercent < 70) matchClass = 'match-medium';
-        if (matchPercent < 50) matchClass = 'match-low';
+      const headerMatch = firstLine.match(/^\[(\d+)%\s*match\]\s*(.*)$/);
+      let matchPercent = 100;
+      let subject = 'Email Summary';
+      let summaryBody = summaryText;
 
-        return `
-          <div class="email-summary-item" data-id="${s.id}">
+      if (headerMatch) {
+        matchPercent = parseInt(headerMatch[1], 10);
+        subject = (headerMatch[2] || '').trim() || 'Email Summary';
+        summaryBody = restText;
+      } else if (lines.length > 1) {
+        subject = firstLine || 'Email Summary';
+        summaryBody = restText;
+      } else {
+        subject = 'Email Summary';
+        summaryBody = summaryText.trim();
+      }
+
+      // Color code by match quality
+      let matchClass = 'match-high';
+      if (matchPercent < 70) matchClass = 'match-medium';
+      if (matchPercent < 50) matchClass = 'match-low';
+
+      // Parse participants and detect category for "Apply to Task" feature
+      const participants = parseParticipantsFromSummary(summaryText);
+      const detectedCategory = detectCategoryFromSummary(summaryText);
+      const matchedAssignees = matchParticipantsToTeamMembers(participants);
+      const summaryNotes = parseSummaryBodyFromSummary(summaryText);
+
+      // Store for "Apply to Task" button
+      lastParsedSmartBrief = {
+        participants,
+        detectedCategory,
+        matchedAssignees,
+        summaryNotes,
+        matchPercent,
+        subject
+      };
+
+      // Build participant chips HTML
+      let participantChipsHtml = '';
+      if (participants.length > 0) {
+        const chips = participants.map(p => {
+          const isMatched = matchedAssignees.some(a => a.toLowerCase().includes(p.name.split(' ')[0].toLowerCase()));
+          const chipClass = isMatched ? 'participant-chip matched' : 'participant-chip';
+          const title = p.email ? p.email : p.name;
+          return `<span class="${chipClass}" title="${escapeHtml(title)}">${escapeHtml(p.name)}</span>`;
+        }).join('');
+        participantChipsHtml = `
+          <div class="participants-section">
+            <div class="participants-label">Participants:</div>
+            <div class="participants-chips">${chips}</div>
+          </div>
+        `;
+      }
+
+      // Build match warning HTML (if < 50%)
+      let matchWarningHtml = '';
+      if (matchPercent < 50) {
+        matchWarningHtml = `
+          <div class="match-warning">
+            ⚠️ Low confidence match (${matchPercent}%) — verify this is the correct email thread
+          </div>
+        `;
+      }
+
+      // Build "Apply to Task" button HTML
+      let applyButtonHtml = '';
+      if (detectedCategory || matchedAssignees.length > 0 || summaryNotes) {
+        applyButtonHtml = `
+          <div class="smartbrief-actions">
+            <button id="applySmartBriefBtn" class="btn-apply-smartbrief">
+              ✨ Review & Apply to Task
+            </button>
+          </div>
+        `;
+      }
+
+      // Remove participant names from summary body to avoid redundancy with chips
+      let cleanedSummaryBody = summaryBody;
+      // Remove the PARTICIPANTS section if present (already shown as chips)
+      cleanedSummaryBody = cleanedSummaryBody.replace(/## PARTICIPANTS[\s\S]*?(?=## |$)/, '').trim();
+      // Clean up any leading/trailing whitespace or empty lines
+      cleanedSummaryBody = cleanedSummaryBody.replace(/^\n+/, '').replace(/\n{3,}/g, '\n\n');
+
+      if (emailSummaryList) {
+        emailSummaryList.innerHTML = `
+          ${matchWarningHtml}
+          <div class="email-summary-item">
             <div class="email-summary-subject">
-              ${escapeHtml(s.subject || 'No subject')}
-              <span class="match-score ${matchClass}" title="Company: ${companyPercent}% | Date: ${datePercent}%">
+              ${escapeHtml(subject)}
+              <span class="match-score ${matchClass}" title="Match score from SmartBrief">
                 ${matchPercent}% match
               </span>
             </div>
-            <div class="email-summary-meta">
-              From: ${escapeHtml(s.from || 'Unknown')} | ${formatEmailDate(s.date)}
-            </div>
-            <div class="email-summary-text">${escapeHtml(s.summary || 'No summary available')}</div>
+            ${participantChipsHtml}
+            <div class="email-summary-text">${escapeHtml(cleanedSummaryBody).replace(/\n/g, '<br>')}</div>
           </div>
+          ${applyButtonHtml}
         `;
-      }).join('');
+
+        // Wire "Apply to Task" button to show confirmation modal
+        const applyBtn = qs('#applySmartBriefBtn');
+        if (applyBtn) {
+          applyBtn.addEventListener('click', () => showSmartBriefConfirmation());
+        }
+      }
 
     } catch (err) {
-      console.error('Error loading email summaries:', err);
+      console.error('Error loading email summary from column L:', err);
       if (emailSummaryList) {
-        emailSummaryList.innerHTML = `<div class="email-no-summaries">Error loading summaries: ${escapeHtml(err.message)}<br><small>Make sure the Email Summarizer service is running.</small></div>`;
+        emailSummaryList.innerHTML = `<div class="email-no-summaries">Error reading summary: ${escapeHtml(err.message)}</div>`;
       }
+    }
+  }
+
+  // Show confirmation modal for SmartBrief suggestions
+  function showSmartBriefConfirmation() {
+    if (!lastParsedSmartBrief) {
+      showToast('No SmartBrief data to apply', 'error');
+      return;
+    }
+
+    const { detectedCategory, matchedAssignees, summaryNotes } = lastParsedSmartBrief;
+    
+    // Build suggestion items with checkboxes
+    let suggestionsHtml = '';
+    let hasSuggestions = false;
+
+    if (detectedCategory) {
+      hasSuggestions = true;
+      suggestionsHtml += `
+        <div class="smartbrief-suggestion-item">
+          <label>
+            <input type="checkbox" id="sbApplyCategory" checked>
+            <span class="suggestion-label">Task Category:</span>
+            <span class="suggestion-value">${escapeHtml(detectedCategory)}</span>
+          </label>
+        </div>
+      `;
+    }
+
+    // Individual checkboxes for each assignee (so users can uncheck irrelevant ones)
+    if (matchedAssignees && matchedAssignees.length > 0) {
+      hasSuggestions = true;
+      const assigneeCheckboxes = matchedAssignees.map((assignee, idx) => `
+        <label class="assignee-checkbox-item">
+          <input type="checkbox" class="sb-assignee-checkbox" data-assignee="${escapeHtml(assignee)}" checked>
+          <span>${escapeHtml(assignee)}</span>
+        </label>
+      `).join('');
+      
+      suggestionsHtml += `
+        <div class="smartbrief-suggestion-item smartbrief-assignees-group">
+          <div class="suggestion-label">Assignees:</div>
+          <div class="assignee-checkboxes-list">
+            ${assigneeCheckboxes}
+          </div>
+        </div>
+      `;
+    }
+
+    if (summaryNotes) {
+      hasSuggestions = true;
+      const truncatedPreview = summaryNotes.length > 100 ? summaryNotes.substring(0, 100) + '...' : summaryNotes;
+      suggestionsHtml += `
+        <div class="smartbrief-suggestion-item">
+          <label>
+            <input type="checkbox" id="sbApplyNotes">
+            <span class="suggestion-label">Add to Notes:</span>
+            <span class="suggestion-value suggestion-notes">${escapeHtml(truncatedPreview)}</span>
+          </label>
+        </div>
+      `;
+    }
+
+    if (!hasSuggestions) {
+      showToast('No suggestions available', 'info');
+      return;
+    }
+
+    // Create modal overlay
+    const overlay = document.createElement('div');
+    overlay.className = 'confirm-overlay';
+    overlay.id = 'smartbriefConfirmOverlay';
+
+    const box = document.createElement('div');
+    box.className = 'confirm-box smartbrief-confirm-box';
+    box.innerHTML = `
+      <div class="smartbrief-confirm-header">
+        <span class="sparkle">✨</span> Review Suggestions
+      </div>
+      <p class="smartbrief-confirm-desc">Select which items to apply to the task:</p>
+      <div class="smartbrief-suggestions">
+        ${suggestionsHtml}
+      </div>
+      <div class="smartbrief-confirm-buttons">
+        <button class="btn-confirm-cancel" id="sbCancel">Cancel</button>
+        <button class="btn-apply-confirmed" id="sbApply">Apply Selected</button>
+      </div>
+    `;
+
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+
+    // Wire buttons
+    const cancelBtn = overlay.querySelector('#sbCancel');
+    const applyBtn = overlay.querySelector('#sbApply');
+
+    cancelBtn.addEventListener('click', () => overlay.remove());
+    
+    applyBtn.addEventListener('click', () => {
+      const applyCategory = overlay.querySelector('#sbApplyCategory')?.checked;
+      const applyNotes = overlay.querySelector('#sbApplyNotes')?.checked;
+      
+      // Collect individually selected assignees
+      const selectedAssignees = [];
+      overlay.querySelectorAll('.sb-assignee-checkbox:checked').forEach(cb => {
+        selectedAssignees.push(cb.getAttribute('data-assignee'));
+      });
+      
+      overlay.remove();
+      applySmartBriefSelections(applyCategory, selectedAssignees, applyNotes);
+    });
+
+    // Close on overlay click
+    overlay.addEventListener('click', (e) => {
+      if (e.target === overlay) overlay.remove();
+    });
+  }
+
+  // Apply selected SmartBrief suggestions to the task form
+  // applyAssignees is now an array of selected assignee names (not a boolean)
+  function applySmartBriefSelections(applyCategory, selectedAssignees, applyNotes) {
+    if (!lastParsedSmartBrief) return;
+
+    const { detectedCategory, summaryNotes } = lastParsedSmartBrief;
+    let appliedItems = [];
+
+    // 1. Apply detected category
+    if (applyCategory && detectedCategory) {
+      const categoryCheckboxes = document.querySelectorAll('#taskCategories .category-toggle');
+      categoryCheckboxes.forEach(cb => {
+        if (cb.value === detectedCategory) {
+          cb.checked = true;
+          appliedItems.push(`Category: ${detectedCategory}`);
+        }
+      });
+      // Trigger visibility sync for task cards
+      syncTasksVisibility();
+    }
+
+    // 2. Apply selected assignees (now receives array of individually selected assignees)
+    if (selectedAssignees && Array.isArray(selectedAssignees) && selectedAssignees.length > 0) {
+      const assigneeCheckboxes = document.querySelectorAll('#assignees input[type=checkbox]');
+      assigneeCheckboxes.forEach(cb => {
+        if (selectedAssignees.includes(cb.value)) {
+          cb.checked = true;
+        }
+      });
+      // Update per-task dropdowns
+      updateTaskAssigneeDropdowns();
+      // Reorder checked to top
+      reorderCheckboxesToTop('#assignees');
+      appliedItems.push(`Assignees: ${selectedAssignees.join(', ')}`);
+    }
+
+    // 3. Apply summary notes to Extra Note field (append, don't overwrite)
+    if (applyNotes && summaryNotes && extraNoteEl) {
+      const existingNote = extraNoteEl.value.trim();
+      const notePrefix = '[From SmartBrief] ';
+      // Only add if not already present
+      if (!existingNote.includes(notePrefix)) {
+        const truncatedNotes = summaryNotes.length > 500 ? summaryNotes.substring(0, 500) + '...' : summaryNotes;
+        extraNoteEl.value = existingNote 
+          ? `${existingNote}\n\n${notePrefix}${truncatedNotes}`
+          : `${notePrefix}${truncatedNotes}`;
+        appliedItems.push('Notes added');
+      }
+    }
+
+    // Mark form as having unsaved changes
+    if (appliedItems.length > 0) {
+      setUnsavedChanges(true);
+      showToast(`✨ Applied: ${appliedItems.join(', ')}`, 'success');
+    } else {
+      showToast('No items selected', 'info');
     }
   }
 
@@ -2550,58 +3001,8 @@
     }
   }
 
-  // Confirm a draft summary and link it to the current task
-  window.confirmEmailSummary = async function(summaryId) {
-    if (currentRowNum === null || currentRowNum === 'new') {
-      showToast('Please save the task first', 'error');
-      return;
-    }
-
-    try {
-      // Call the API to confirm the summary
-      const response = await fetch(`${EMAIL_SUMMARIZER_API_URL}/api/task-manager/confirm/${summaryId}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ task_row: currentRowNum })
-      });
-
-      if (!response.ok) {
-        throw new Error(`Server returned ${response.status}`);
-      }
-
-      // Write summary reference to column L in Excel
-      await Excel.run(async (context) => {
-        const sheet = context.workbook.worksheets.getItemOrNullObject('TASK MANAGER FORM');
-        sheet.load('name');
-        await context.sync();
-
-        if (sheet.isNullObject) {
-          throw new Error('Sheet not found');
-        }
-
-        const cell = sheet.getRange(`L${currentRowNum}`);
-        cell.load('values');
-        await context.sync();
-
-        // Append or create new reference
-        const existing = (cell.values && cell.values[0] && cell.values[0][0])
-          ? String(cell.values[0][0])
-          : '';
-        const newRef = `[Email Summary #${summaryId}]`;
-        cell.values = [[existing ? `${existing} ${newRef}` : newRef]];
-        await context.sync();
-      });
-
-      showToast('Summary confirmed and linked!', 'success');
-
-      // Reload summaries to reflect the change
-      await loadEmailSummaries();
-
-    } catch (err) {
-      console.error('Error confirming summary:', err);
-      showToast('Error confirming summary: ' + err.message, 'error');
-    }
-  };
+  // Note: Email summaries are now populated by VBA SmartBrief macro into column L
+  // The add-in reads from column L instead of calling the API directly
 
   // Initial load when Office host is ready
   if (typeof Office !== 'undefined' && typeof Office.onReady === 'function') {
