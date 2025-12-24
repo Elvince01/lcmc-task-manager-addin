@@ -1,0 +1,27 @@
+# Dev files
+node_modules/
+src/
+.vscode/
+_old/
+dist/
+
+# Config files
+.DS_Store
+.eslintrc.json
+babel.config.json
+webpack.config.js
+package.json
+package-lock.json
+
+# Internal docs
+DEPLOY.md
+LCMC-Task-Manager-User-Guide.md
+SmartBrief.bas
+
+# Dev manifests
+manifest-internal.xml
+manifest-localhost.xml
+
+# Source maps
+*.map
+*.LICENSE.txt
