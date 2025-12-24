@@ -3346,36 +3346,23 @@
       
       // Apply pattern-based assignee suggestions (only if checked) - delay to ensure cards exist
       setTimeout(() => {
-        let debugLog = 'DEBUG: Applying task assignees...\n';
-        debugLog += `DEBUG: taskAssigneesMap: ${JSON.stringify([...taskAssigneesMap.entries()])}\n`;
-        debugLog += `DEBUG: tasksFromModal: ${JSON.stringify(tasksFromModal)}\n`;
-        
         tasksFromModal.forEach(taskName => {
           const selectedAssigneesForTask = taskAssigneesMap.get(taskName) || [];
           const suggestedAssignee = selectedAssigneesForTask.length > 0 ? selectedAssigneesForTask[0] : null;
           
-          debugLog += `DEBUG: Task "${taskName}" -> suggested assignee: "${suggestedAssignee}"\n`;
-          
           if (suggestedAssignee) {
             // Find the task card for this task
             const taskCard = document.querySelector(`#taskCards .task-card[data-task="${taskName}"]`);
-            debugLog += `DEBUG: Found task card for "${taskName}": ${!!taskCard}\n`;
             
             if (taskCard) {
               const assigneeSelect = taskCard.querySelector('.task-assignee-select');
-              debugLog += `DEBUG: Found assignee select: ${!!assigneeSelect}\n`;
               
               if (assigneeSelect) {
-                const options = Array.from(assigneeSelect.options).map(opt => opt.value);
-                debugLog += `DEBUG: Dropdown options: ${JSON.stringify(options)}\n`;
-                
                 // Check if the suggested assignee is in the dropdown
                 const option = Array.from(assigneeSelect.options).find(opt => opt.value === suggestedAssignee);
-                debugLog += `DEBUG: Found matching option for "${suggestedAssignee}": ${!!option}\n`;
                 
                 if (option) {
                   assigneeSelect.value = suggestedAssignee;
-                  debugLog += `DEBUG: Set assignee to "${suggestedAssignee}"\n`;
                   // Add a visual indicator that this was auto-suggested
                   assigneeSelect.style.backgroundColor = '#f0f9ff';
                   assigneeSelect.title = `Auto-suggested based on pattern: ${taskName} → ${suggestedAssignee}`;
@@ -3384,13 +3371,6 @@
             }
           }
         });
-        
-        // Show debug in task pane
-        const debugDiv = document.createElement('div');
-        debugDiv.style.cssText = 'position:fixed;top:10px;right:10px;background:#f0f0f0;padding:10px;border:1px solid #ccc;z-index:10000;max-width:400px;white-space:pre-wrap;font-family:monospace;font-size:11px;';
-        debugDiv.textContent = debugLog;
-        document.body.appendChild(debugDiv);
-        setTimeout(() => debugDiv.remove(), 10000);
       }, 100);
       
       // Set all task statuses to "To Do" by default
