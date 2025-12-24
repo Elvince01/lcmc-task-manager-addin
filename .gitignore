@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+
+# Build output folder
+dist/
+
+# Source files
+src/
+
+# Config files
+package.json
+package-lock.json
+webpack.config.js
+babel.config.json
+.eslintrc.json
+
+# Local manifest variants
+manifest-localhost.xml
+manifest-internal.xml
+
+# OS files
+.DS_Store
