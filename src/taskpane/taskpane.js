@@ -15,16 +15,111 @@
 
   const EMAIL_SUMMARIZER_API_URL = 'http://192.168.1.141:5002';
   const SMARTBRIEF_MATCH_THRESHOLD = 0.5;
+  
+  // Task-assignee pattern mapping
+  let taskAssigneePatterns = new Map(); // taskName -> Map(assignee -> count)
+  
+  // Build task-assignee pattern map from existing Excel data
+  async function buildTaskAssigneePatterns() {
+    try {
+      await Excel.run(async (context) => {
+        const sheet = context.workbook.worksheets.getItemOrNullObject('TASK MANAGER FORM');
+        sheet.load('name');
+        await context.sync();
+        
+        if (!sheet || sheet.isNullObject) {
+          return;
+        }
+        
+        // Clear existing patterns
+        taskAssigneePatterns.clear();
+        
+        // Read rows 2-1000 one by one
+        for (let row = 2; row <= 1000; row++) {
+          const hRange = sheet.getRange(`H${row}`);
+          hRange.load('values');
+          hRange.load('text');
+          await context.sync();
+          
+          // Check if we have data
+          const hasValue = hRange.values && hRange.values[0] && hRange.values[0][0];
+          const hasText = hRange.text && hRange.text[0] && hRange.text[0][0];
+          
+          if (!hasValue && !hasText) continue; // Skip empty rows
+          
+          const taskData = hRange.values[0][0] || hRange.text[0][0];
+          
+                    
+          if (typeof taskData === 'string') {
+            // Split by lines first, then by semicolon
+            const lines = taskData.split('\n');
+            
+            lines.forEach(line => {
+              if (!line.trim()) return;
+              
+              // Parse format: "Task: Status || Assigned to Assignee || Comment: ..."
+              const taskEntries = line.split(';');
+              
+              taskEntries.forEach(entry => {
+                // Extract task name (before first colon)
+                const colonIndex = entry.indexOf(':');
+                if (colonIndex === -1) return;
+                
+                const taskName = entry.substring(0, colonIndex).trim();
+                if (!taskName) return;
+                
+                // Extract assignee after "Assigned to"
+                const assignedToMatch = entry.match(/Assigned to ([^|]+)/);
+                if (assignedToMatch) {
+                  const assignee = assignedToMatch[1].trim();
+                  
+                  if (assignee && assignee !== '') {
+                    // Update pattern map for this task-assignee pair
+                    if (!taskAssigneePatterns.has(taskName)) {
+                      taskAssigneePatterns.set(taskName, new Map());
+                    }
+                    
+                    const patternMap = taskAssigneePatterns.get(taskName);
+                    patternMap.set(assignee, (patternMap.get(assignee) || 0) + 1);
+                  }
+                }
+              });
+            });
+          }
+        }
+      });
+    } catch (error) {
+      console.error('Error building task-assignee patterns:', error);
+    }
+  }
+  
+  // Get most common assignee for a task based on patterns
+  function getMostCommonAssignee(taskName) {
+    const patterns = taskAssigneePatterns.get(taskName);
+    if (!patterns || patterns.size === 0) return null;
+    
+    let maxCount = 0;
+    let mostCommonAssignee = null;
+    
+    patterns.forEach((count, assignee) => {
+      if (count > maxCount) {
+        maxCount = count;
+        mostCommonAssignee = assignee;
+      }
+    });
+    
+    return mostCommonAssignee;
+  }
 
   // Toast notification helper
-  function showToast(message, type = 'success') {
+  function showToast(message, type = 'success', duration = 3000) {
     const toast = qs('#toast');
     if (!toast) return;
     toast.textContent = message;
     toast.className = 'toast ' + type + ' show';
     setTimeout(() => {
       toast.classList.remove('show');
-    }, 3000);
+    }, duration);
   }
 
   // Check for missing fields and return array of missing field names
@@ -55,6 +150,7 @@
       missing.push('Assigned To');
     }
 
+    
     // Check visible task cards for status and deadline
     const visibleTaskCards = Array.from(document.querySelectorAll('.task-card')).filter(card => {
       return card.style.display !== 'none' && card.id !== 'otherTaskCard';
@@ -90,11 +186,23 @@
       }
     }
 
+    // Check email frequency (always at the end)
+    const emailFrequency = qs('#emailFrequency');
+    if (emailFrequency) {
+      const isEmpty = emailFrequency.tagName === 'SELECT' 
+        ? emailFrequency.selectedIndex <= 0 || !emailFrequency.value
+        : !emailFrequency.value || emailFrequency.value.trim() === '';
+      
+      if (isEmpty) {
+        missing.push('🕐 Email Frequency');
+      }
+    }
+
     return missing;
   }
 
   // Show missing fields warning in a styled popup
-  function showMissingFieldsWarning(missingFields) {
+  function showMissingFieldsWarning(missingFields, successMessage = null) {
     // Create overlay
     const overlay = document.createElement('div');
     overlay.className = 'confirm-overlay';
@@ -106,31 +214,41 @@
     box.style.maxWidth = '320px';
     box.style.textAlign = 'left';
 
-    // Title
-    const title = document.createElement('p');
-    title.innerHTML = '<strong style="color:#f59e0b;">⚠️ Missing Fields</strong>';
-    title.style.marginBottom = '12px';
-    title.style.textAlign = 'center';
-    box.appendChild(title);
+    // Title and content
+    if (missingFields.length === 0 && successMessage) {
+      // Show success message only
+      const title = document.createElement('p');
+      title.innerHTML = `<strong style="color:#10b981;">${successMessage}</strong>`;
+      title.style.marginBottom = '12px';
+      title.style.textAlign = 'center';
+      box.appendChild(title);
+    } else {
+      // Show missing fields
+      const title = document.createElement('p');
+      title.innerHTML = '<strong style="color:#f59e0b;">⚠️ Missing Fields</strong>';
+      title.style.marginBottom = '12px';
+      title.style.textAlign = 'center';
+      box.appendChild(title);
 
-    // Description
-    const desc = document.createElement('p');
-    desc.textContent = 'The following fields are empty:';
-    desc.style.fontSize = '12px';
-    desc.style.color = '#64748b';
-    desc.style.marginBottom = '8px';
-    box.appendChild(desc);
+      // Description
+      const desc = document.createElement('p');
+      desc.textContent = successMessage || 'The following fields are empty:';
+      desc.style.fontSize = '12px';
+      desc.style.color = '#64748b';
+      desc.style.marginBottom = '8px';
+      box.appendChild(desc);
 
-    // List of missing fields
-    const list = document.createElement('ul');
-    list.style.cssText = 'margin:0 0 16px 0;padding-left:20px;font-size:12px;color:#334155;max-height:150px;overflow-y:auto;';
-    missingFields.forEach(field => {
-      const li = document.createElement('li');
-      li.textContent = field;
-      li.style.marginBottom = '4px';
-      list.appendChild(li);
-    });
-    box.appendChild(list);
+      // List of missing fields
+      const list = document.createElement('ul');
+      list.style.cssText = 'margin:0 0 16px 0;padding-left:20px;font-size:12px;color:#334155;max-height:150px;overflow-y:auto;';
+      missingFields.forEach(field => {
+        const li = document.createElement('li');
+        li.textContent = field;
+        li.style.marginBottom = '4px';
+        list.appendChild(li);
+      });
+      box.appendChild(list);
+    }
 
     // Close button
     const btnWrap = document.createElement('div');
@@ -158,6 +276,12 @@
   }
 
   // ============== SmartBrief Parsing Helpers ==============
+
+  function isLcmCommoditiesEmail(email) {
+    if (!email) return false;
+    const s = String(email).trim().toLowerCase();
+    return s.endsWith('@lcmcommodities.com');
+  }
 
   // Parse participants from SmartBrief summary
   // Format: "## PARTICIPANTS\n- Name (email@domain.com)\n- Name2 (email2@domain.com)"
@@ -214,40 +338,94 @@
     return null; // No clear category detected
   }
 
-  // Match participants to team members (fuzzy match by name)
+  // Detect relevant tasks from summary text
+  function detectTasksFromSummary(summaryText) {
+    const text = (summaryText || '').toLowerCase();
+    const suggestedTasks = [];
+    
+    // Task keyword mappings
+    const taskMappings = [
+      { keywords: ['give-up', 'giveup', 'give up'], task: 'Give-up Agreement' },
+      { keywords: ['broker agreement', 'brokerage agreement', 'brokerage'], task: 'Broker Agreement' },
+      { keywords: ['annex a', 'amend annex', 'amendment'], task: 'Amend Annex A' },
+      { keywords: ['kyc', 'know your client', 'due diligence'], task: 'KYC (produced by LCMC)' },
+      { keywords: ['external kyc', 'third party kyc', 'counterparty kyc'], task: 'KYC External' }
+    ];
+    
+    // Check each mapping
+    taskMappings.forEach(mapping => {
+      if (mapping.keywords.some(keyword => text.includes(keyword))) {
+        suggestedTasks.push(mapping.task);
+      }
+    });
+    
+    // Remove duplicates while preserving order
+    return [...new Set(suggestedTasks)];
+  }
+
+  // Match participants to team members
   // IMPORTANT: Only LCMCommodities employees can be assignees
   // External participants (non-lcmcommodities.com emails) are excluded
   function matchParticipantsToTeamMembers(participants) {
+    // Debug logging
+    console.log('=== SMARTBRIEF MATCH DEBUG ===');
+    console.log('Total participants found:', participants.length);
+    console.log('All participants:', participants);
+    
+    // Also show a toast notification
+    showToast(`SmartBrief: Processing ${participants.length} participants`, 'info');
+    
     const teamCheckboxes = Array.from(document.querySelectorAll('#assignees input[type=checkbox]'));
-    const teamNames = teamCheckboxes.map(cb => cb.value.toLowerCase());
+    
+    // Create team entries with email support - only include those with emails
+    const teamEntries = teamCheckboxes
+      .filter(cb => cb.dataset.email && cb.dataset.email.trim().length > 0)
+      .map(cb => {
+        const raw = String(cb.value || '');
+        const email = String(cb.dataset.email || '').toLowerCase();
+        const normalizeName = (s) => String(s || '')
+          .toLowerCase()
+          .replace(/[^a-z0-9\s]/g, ' ')
+          .replace(/\s+/g, ' ')
+          .trim();
+        
+        const norm = normalizeName(raw);
+        const parts = norm.split(' ').filter(Boolean);
+        return {
+          cb,
+          raw,
+          norm,
+          email,
+          first: parts[0] || '',
+          last: parts.length > 1 ? parts[parts.length - 1] : '',
+          isSingleToken: parts.length <= 1
+        };
+      });
+
     const matched = [];
     
     // Filter to only LCMCommodities participants first
-    const lcmParticipants = participants.filter(p => {
-      if (!p.email) return false; // No email = can't verify, skip
-      const emailLower = p.email.toLowerCase();
-      return emailLower.endsWith('@lcmcommodities.com') || emailLower.endsWith('@lcmc.com');
-    });
+    const lcmParticipants = participants.filter(p => isLcmCommoditiesEmail(p.email));
     
+    console.log('[SmartBrief] LCM participants:', lcmParticipants.map(p => ({ name: p.name, email: p.email })));
+    console.log('[SmartBrief] Team entries:', teamEntries.map(e => ({ raw: e.raw, norm: e.norm, first: e.first, last: e.last, isSingleToken: e.isSingleToken })));
+
     lcmParticipants.forEach(p => {
-      const pNameLower = p.name.toLowerCase();
-      // Try exact match first
-      let idx = teamNames.findIndex(t => t === pNameLower);
-      // Try partial match (first name)
-      if (idx === -1) {
-        const firstName = pNameLower.split(' ')[0];
-        idx = teamNames.findIndex(t => t.startsWith(firstName) || t.includes(firstName));
+      const pEmail = (p.email || '').toLowerCase();
+      let matchedEntry = null;
+      let matchReason = '';
+
+      // Only match by exact email - no fallbacks
+      if (pEmail) {
+        matchedEntry = teamEntries.find(e => e.email && e.email === pEmail);
+        if (matchedEntry) matchReason = 'exact email';
       }
-      // Try email prefix match
-      if (idx === -1 && p.email) {
-        const emailPrefix = p.email.split('@')[0].toLowerCase();
-        idx = teamNames.findIndex(t => {
-          const tFirstName = t.split(' ')[0];
-          return emailPrefix.includes(tFirstName) || tFirstName.includes(emailPrefix);
-        });
-      }
-      if (idx !== -1) {
-        matched.push(teamCheckboxes[idx].value);
+
+      if (matchedEntry) {
+        console.log(`[SmartBrief] Matched participant "${p.name}" (${p.email}) -> team "${matchedEntry.raw}" via ${matchReason}`);
+        matched.push(matchedEntry.raw);
+      } else {
+        console.log(`[SmartBrief] No match for participant "${p.name}" (${p.email}) - no email match found`);
       }
     });
     
@@ -258,31 +436,65 @@
   let lastParsedSmartBrief = null;
 
   async function fetchSmartBriefSummaryFromApi(company, initialRequest, introEmail, remindersStart) {
-    const useLocalProxy = typeof window !== 'undefined'
-      && window.location
-      && window.location.hostname === 'localhost'
-      && window.location.protocol === 'https:';
-
-    const baseUrl = useLocalProxy ? '' : EMAIL_SUMMARIZER_API_URL;
+    // Use proxy path on localhost (webpack dev server proxies /api to the API server)
+    // This avoids mixed-content issues (HTTPS page calling HTTP API)
+    const isLocalhost = typeof window !== 'undefined' 
+      && window.location 
+      && window.location.hostname === 'localhost';
+    
+    const baseUrl = isLocalhost ? '' : EMAIL_SUMMARIZER_API_URL;
     const url = `${baseUrl}/api/task-manager/summaries/${encodeURIComponent(company)}`;
 
     try {
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          initial_request: initialRequest,
-          intro_email: introEmail,
-          reminders_start: remindersStart,
-          threshold: SMARTBRIEF_MATCH_THRESHOLD
-        })
-      });
+      // Only include dates that are non-empty to avoid API datetime parsing issues
+      const requestBody = { threshold: SMARTBRIEF_MATCH_THRESHOLD };
+      if (initialRequest) requestBody.initial_request = initialRequest;
+      if (introEmail) requestBody.intro_email = introEmail;
+      if (remindersStart) requestBody.reminders_start = remindersStart;
 
-      if (!response.ok) {
-        throw new Error(`Server returned ${response.status}`);
+      const doFetch = async (bodyObj) => {
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(bodyObj)
+        });
+
+        if (response.ok) {
+          return { ok: true, status: response.status, data: await response.json() };
+        }
+
+        let serverMsg = '';
+        try {
+          const errJson = await response.json();
+          if (errJson && typeof errJson === 'object') {
+            serverMsg = String(errJson.error || errJson.message || '');
+          }
+        } catch (_) {
+          try {
+            serverMsg = String(await response.text());
+          } catch (_) {
+            serverMsg = '';
+          }
+        }
+
+        return { ok: false, status: response.status, serverMsg };
+      };
+
+      // First attempt (with any provided date filters)
+      let result = await doFetch(requestBody);
+
+      // Workaround: API can 500 on date parsing (offset-naive vs offset-aware). Retry without dates.
+      const hasDates = Boolean(requestBody.initial_request || requestBody.intro_email || requestBody.reminders_start);
+      if (!result.ok && result.status === 500 && hasDates) {
+        result = await doFetch({ threshold: SMARTBRIEF_MATCH_THRESHOLD });
       }
 
-      const data = await response.json();
+      if (!result.ok) {
+        const suffix = result.serverMsg ? `: ${result.serverMsg}` : '';
+        throw new Error(`Server returned ${result.status}${suffix}`);
+      }
+
+      const data = result.data;
       const summaries = Array.isArray(data.summaries) ? data.summaries : [];
       if (summaries.length === 0) return '';
 
@@ -329,6 +541,42 @@
     const div = document.createElement('div');
     div.textContent = String(text || '');
     return div.innerHTML;
+  }
+
+  function formatSmartBriefBodyToHtml(bodyText) {
+    const text = String(bodyText || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    const lines = text.split('\n');
+
+    const out = [];
+    let lastWasBlank = false;
+
+    lines.forEach((line) => {
+      const headerMatch = line.match(/^##\s*(.+?)\s*$/);
+      if (headerMatch) {
+        const title = headerMatch[1].trim();
+        out.push(
+          `<div style="margin-top:10px;margin-bottom:6px;color:var(--primary);font-weight:700;font-size:11px;letter-spacing:.6px;text-transform:uppercase;">${escapeHtml(title)}</div>`
+        );
+        lastWasBlank = false;
+        return;
+      }
+
+      // Remove markdown task checkboxes (e.g. "- [ ] Do something", "- [x] Done")
+      const normalizedLine = String(line).replace(/^(\s*-\s*)\[(?:\s|x|X)\]\s+/, '$1');
+
+      if (!normalizedLine.trim()) {
+        if (!lastWasBlank) {
+          out.push('<div style="height:8px"></div>');
+          lastWasBlank = true;
+        }
+        return;
+      }
+
+      out.push(`<div>${escapeHtml(normalizedLine)}</div>`);
+      lastWasBlank = false;
+    });
+
+    return out.join('');
   }
 
   // Due date warning helper
@@ -407,19 +655,27 @@
 
         if (currentRowNum === null || currentRowNum === 'new') {
           await addNewTask();
-          showToast('✅ New task added successfully!', 'success');
+          if (missingFields.length === 0) {
+            // Show success in central popup only
+            showMissingFieldsWarning([], '🎉 Excellent! Task completed with all required fields properly filled.');
+          } else {
+            // Show missing fields in central popup only
+            showMissingFieldsWarning(missingFields, '✅ New task added successfully!');
+          }
         } else {
           await saveToActiveRow();
-          showToast('✅ Changes saved to row ' + currentRowNum, 'success');
+          if (missingFields.length === 0) {
+            // Show success in central popup only
+            showMissingFieldsWarning([], '🎉 Perfect! All task details are complete and saved successfully.');
+          } else {
+            // Show missing fields in central popup only
+            showMissingFieldsWarning(missingFields, `✅ Changes saved to row ${currentRowNum}!`);
+          }
         }
         setUnsavedChanges(false);
-
-        // Show missing fields warning after successful save
-        if (missingFields.length > 0) {
-          setTimeout(() => {
-            showMissingFieldsWarning(missingFields);
-          }, 500); // Delay to let the success toast show first
-        }
+        
+        // Update task-assignee patterns after successful save
+        buildTaskAssigneePatterns();
       } catch (e) {
         console.error('Save error:', e);
         showToast('❌ Save failed: ' + e.message, 'error');
@@ -1482,23 +1738,25 @@
         return;
       }
 
-      // Read column A only for team member names
+      // Read columns A and B for names and emails
       const usedRange = sheet.getUsedRange();
       usedRange.load('values');
       await context.sync();
 
       const values = usedRange.values || [];
-      const namesRaw = values.slice(1) // skip header row
-        .map(row => row[0])
-        .filter(n => n && String(n).trim().length > 0)
-        .map(n => String(n).trim());
+      const teamMembers = values.slice(1) // skip header row
+        .map(row => ({
+          name: row[0] ? String(row[0]).trim() : '',
+          email: row[1] ? String(row[1]).trim().toLowerCase() : ''
+        }))
+        .filter(m => m.name && m.name.length > 0);
 
-      const names = Array.from(new Set(namesRaw)); // dedupe
-      console.log('Team members loaded from column A:', names); // Debug log
+      console.log('Team members loaded from columns A and B:', teamMembers); // Debug log
 
-      names.forEach(n => {
+      teamMembers.forEach(m => {
         const w = document.createElement('div');
-        w.innerHTML = `<label><input type="checkbox" value="${n}"> ${n}</label>`;
+        // Store email in data attribute for matching
+        w.innerHTML = `<label><input type="checkbox" value="${m.name}" data-email="${m.email}"> ${m.name}</label>`;
         box.appendChild(w);
       });
 
@@ -1508,10 +1766,10 @@
         noneOpt.value = '';
         noneOpt.textContent = '(none)';
         brokerLeadEl.appendChild(noneOpt);
-        names.forEach(n => {
+        teamMembers.forEach(m => {
           const opt = document.createElement('option');
-          opt.value = n;
-          opt.textContent = n;
+          opt.value = m.name;
+          opt.textContent = m.name;
           brokerLeadEl.appendChild(opt);
         });
       }
@@ -2591,10 +2849,15 @@
     });
   }
 
-  // Load email summaries from Column L (populated by VBA SmartBrief macro)
-  // The VBA macro calls the API and writes the summary to column L
-  // This function reads that pre-fetched summary and displays it
+  // Load email summaries from Excel column L (populated by VBA SmartBrief macro)
   async function loadEmailSummaries() {
+    console.log('=== LOADING EMAIL SUMMARIES ===');
+    const emailSummaryList = qs('#emailSummaryList');
+    if (!emailSummaryList) {
+      console.log('emailSummaryList element not found');
+      return;
+    }
+
     const company = companyNameInput ? companyNameInput.value.trim() : '';
     if (!company) {
       showToast('No company name entered', 'error');
@@ -2731,11 +2994,12 @@
       if (matchPercent < 70) matchClass = 'match-medium';
       if (matchPercent < 50) matchClass = 'match-low';
 
-      // Parse participants and detect category for "Apply to Task" feature
+      // Parse participants, detect category, and suggest tasks for "Apply to Task" feature
       const participants = parseParticipantsFromSummary(summaryText);
       const detectedCategory = detectCategoryFromSummary(summaryText);
       const matchedAssignees = matchParticipantsToTeamMembers(participants);
       const summaryNotes = parseSummaryBodyFromSummary(summaryText);
+      const suggestedTasks = detectTasksFromSummary(summaryText);
 
       // Store for "Apply to Task" button
       lastParsedSmartBrief = {
@@ -2743,6 +3007,7 @@
         detectedCategory,
         matchedAssignees,
         summaryNotes,
+        suggestedTasks,
         matchPercent,
         subject
       };
@@ -2751,8 +3016,8 @@
       let participantChipsHtml = '';
       if (participants.length > 0) {
         const chips = participants.map(p => {
-          const isMatched = matchedAssignees.some(a => a.toLowerCase().includes(p.name.split(' ')[0].toLowerCase()));
-          const chipClass = isMatched ? 'participant-chip matched' : 'participant-chip';
+          const isInternal = isLcmCommoditiesEmail(p.email);
+          const chipClass = isInternal ? 'participant-chip matched' : 'participant-chip';
           const title = p.email ? p.email : p.name;
           return `<span class="${chipClass}" title="${escapeHtml(title)}">${escapeHtml(p.name)}</span>`;
         }).join('');
@@ -2793,6 +3058,7 @@
       // Clean up any leading/trailing whitespace or empty lines
       cleanedSummaryBody = cleanedSummaryBody.replace(/^\n+/, '').replace(/\n{3,}/g, '\n\n');
 
+      
       if (emailSummaryList) {
         emailSummaryList.innerHTML = `
           ${matchWarningHtml}
@@ -2804,7 +3070,7 @@
               </span>
             </div>
             ${participantChipsHtml}
-            <div class="email-summary-text">${escapeHtml(cleanedSummaryBody).replace(/\n/g, '<br>')}</div>
+            <div class="email-summary-text">${formatSmartBriefBodyToHtml(cleanedSummaryBody)}</div>
           </div>
           ${applyButtonHtml}
         `;
@@ -2827,11 +3093,11 @@
   // Show confirmation modal for SmartBrief suggestions
   function showSmartBriefConfirmation() {
     if (!lastParsedSmartBrief) {
-      showToast('No SmartBrief data to apply', 'error');
+      showToast('No SmartBrief data available', 'error');
       return;
     }
-
-    const { detectedCategory, matchedAssignees, summaryNotes } = lastParsedSmartBrief;
+    
+    const { detectedCategory, matchedAssignees, summaryNotes, suggestedTasks } = lastParsedSmartBrief;
     
     // Build suggestion items with checkboxes
     let suggestionsHtml = '';
@@ -2870,22 +3136,79 @@
       `;
     }
 
-    if (summaryNotes) {
+    // Task suggestions
+    if (suggestedTasks && suggestedTasks.length > 0) {
       hasSuggestions = true;
-      const truncatedPreview = summaryNotes.length > 100 ? summaryNotes.substring(0, 100) + '...' : summaryNotes;
-      suggestionsHtml += `
-        <div class="smartbrief-suggestion-item">
-          <label>
-            <input type="checkbox" id="sbApplyNotes">
-            <span class="suggestion-label">Add to Notes:</span>
-            <span class="suggestion-value suggestion-notes">${escapeHtml(truncatedPreview)}</span>
+      
+      const taskCheckboxes = suggestedTasks.map(task => {
+        const suggestedAssignee = getMostCommonAssignee(task);
+        let assigneeHtml = '';
+        
+        if (suggestedAssignee) {
+          assigneeHtml = `
+            <span class="task-assignee-suggestion">
+              → <input type="checkbox" class="sb-assignee-suggest" data-task="${escapeHtml(task)}" data-assignee="${escapeHtml(suggestedAssignee)}" checked>
+              <span style="color:#1e40af;font-weight:500;">${escapeHtml(suggestedAssignee)}</span>
+            </span>
+          `;
+        }
+        
+        return `
+          <label class="assignee-checkbox-item">
+            <input type="checkbox" class="sb-task-checkbox" data-task="${escapeHtml(task)}" checked>
+            <span>${escapeHtml(task)}${assigneeHtml}</span>
           </label>
+        `;
+      }).join('');
+      
+      suggestionsHtml += `
+        <div class="smartbrief-suggestion-item smartbrief-assignees-group">
+          <div class="suggestion-label">Suggested Tasks <span style="font-size:11px;color:#64748b;">(with pattern-based assignees)</span>:</div>
+          <div class="assignee-checkboxes-list">
+            ${taskCheckboxes}
+          </div>
         </div>
       `;
     }
 
+    
     if (!hasSuggestions) {
-      showToast('No suggestions available', 'info');
+      showToast('No suggestions available - but check for missing fields', 'info');
+      // Still show missing fields even if no suggestions
+      const missingFields = [];
+      
+      // Check dates
+      if (initialRequestInput && !initialRequestInput.value) missingFields.push('Initial Request Date');
+      if (remindersStartInput && !remindersStartInput.value) missingFields.push('Reminders Start Date');
+      
+      // Check broker lead
+      if (brokerLeadEl && !brokerLeadEl.value) missingFields.push('Broker Lead');
+      
+      // Check email frequency
+      const emailFrequencyEl = qs('#emailFrequency');
+      if (emailFrequencyEl) {
+        const isEmpty = emailFrequencyEl.tagName === 'SELECT' 
+          ? emailFrequencyEl.selectedIndex <= 0 || !emailFrequencyEl.value
+          : !emailFrequencyEl.value || emailFrequencyEl.value.trim() === '';
+        
+        if (isEmpty) {
+          missingFields.push('Email Frequency');
+        }
+      }
+      
+      // Check if any tasks are selected
+      const selectedTasks = document.querySelectorAll('#tasksChecklist .task-toggle:checked');
+      if (selectedTasks.length === 0) missingFields.push('Task Selection');
+      
+      // Check if any assignees are selected
+      const selectedAssignees = document.querySelectorAll('#assignees input[type=checkbox]:checked');
+      if (selectedAssignees.length === 0) missingFields.push('Assignees');
+      
+      if (missingFields.length > 0) {
+        setTimeout(() => {
+          showToast(`⚠️ Still needed: ${missingFields.join(', ')}. Click Save when done!`, 'info', 10000);
+        }, 2000);
+      }
       return;
     }
 
@@ -2929,8 +3252,25 @@
         selectedAssignees.push(cb.getAttribute('data-assignee'));
       });
       
+      // Collect selected tasks
+      const selectedTasks = [];
+      overlay.querySelectorAll('.sb-task-checkbox:checked').forEach(cb => {
+        selectedTasks.push(cb.getAttribute('data-task'));
+      });
+      
+      // Collect selected task-specific assignees
+      const taskAssignees = {};
+      overlay.querySelectorAll('.sb-assignee-suggest:checked').forEach(cb => {
+        const task = cb.getAttribute('data-task');
+        const assignee = cb.getAttribute('data-assignee');
+        if (!taskAssignees[task]) {
+          taskAssignees[task] = [];
+        }
+        taskAssignees[task].push(assignee);
+      });
+      
       overlay.remove();
-      applySmartBriefSelections(applyCategory, selectedAssignees, applyNotes);
+      applySmartBriefSelections(applyCategory, selectedAssignees, applyNotes, selectedTasks, taskAssignees);
     });
 
     // Close on overlay click
@@ -2940,11 +3280,10 @@
   }
 
   // Apply selected SmartBrief suggestions to the task form
-  // applyAssignees is now an array of selected assignee names (not a boolean)
-  function applySmartBriefSelections(applyCategory, selectedAssignees, applyNotes) {
+  function applySmartBriefSelections(applyCategory, assigneesFromModal, applyNotes, tasksFromModal = [], taskAssignees = {}) {
     if (!lastParsedSmartBrief) return;
 
-    const { detectedCategory, summaryNotes } = lastParsedSmartBrief;
+    const { detectedCategory, summaryNotes, matchedAssignees } = lastParsedSmartBrief;
     let appliedItems = [];
 
     // 1. Apply detected category
@@ -2956,43 +3295,170 @@
           appliedItems.push(`Category: ${detectedCategory}`);
         }
       });
-      // Trigger visibility sync for task cards
       syncTasksVisibility();
     }
 
-    // 2. Apply selected assignees (now receives array of individually selected assignees)
-    if (selectedAssignees && Array.isArray(selectedAssignees) && selectedAssignees.length > 0) {
-      const assigneeCheckboxes = document.querySelectorAll('#assignees input[type=checkbox]');
-      assigneeCheckboxes.forEach(cb => {
-        if (selectedAssignees.includes(cb.value)) {
+    // 2. Apply selected assignees
+    const selectedAssignees = [];
+    document.querySelectorAll('#smartbriefConfirmOverlay .sb-assignee-checkbox:checked').forEach(cb => {
+      selectedAssignees.push(cb.value);
+    });
+    
+    // Collect selected task-specific assignees from passed parameter
+    const taskAssigneesMap = new Map();
+    const allSuggestedAssignees = new Set();
+    
+    // Convert taskAssignees object to Map
+    Object.entries(taskAssignees).forEach(([task, assignees]) => {
+      taskAssigneesMap.set(task, assignees);
+      assignees.forEach(assignee => allSuggestedAssignees.add(assignee));
+    });
+    
+    // Combine global assignees with suggested assignees
+    const allAssigneesToSelect = new Set([...selectedAssignees, ...allSuggestedAssignees]);
+    
+    if (allAssigneesToSelect.size > 0) {
+      // Ensure these assignees are selected in the main assignees list
+      const allAssigneeCheckboxes = qsa('#assignees input[type=checkbox]');
+      allAssigneeCheckboxes.forEach(cb => {
+        if (allAssigneesToSelect.has(cb.value)) {
           cb.checked = true;
         }
       });
-      // Update per-task dropdowns
       updateTaskAssigneeDropdowns();
-      // Reorder checked to top
       reorderCheckboxesToTop('#assignees');
-      appliedItems.push(`Assignees: ${selectedAssignees.join(', ')}`);
+      appliedItems.push(`Assignees: ${[...allAssigneesToSelect].join(', ')}`);
     }
 
-    // 3. Apply summary notes to Extra Note field (append, don't overwrite)
-    if (applyNotes && summaryNotes && extraNoteEl) {
-      const existingNote = extraNoteEl.value.trim();
-      const notePrefix = '[From SmartBrief] ';
-      // Only add if not already present
-      if (!existingNote.includes(notePrefix)) {
-        const truncatedNotes = summaryNotes.length > 500 ? summaryNotes.substring(0, 500) + '...' : summaryNotes;
-        extraNoteEl.value = existingNote 
-          ? `${existingNote}\n\n${notePrefix}${truncatedNotes}`
-          : `${notePrefix}${truncatedNotes}`;
-        appliedItems.push('Notes added');
+    // 3. Apply selected tasks
+    if (tasksFromModal && tasksFromModal.length > 0) {
+      const taskCheckboxes = document.querySelectorAll('#tasksChecklist .task-toggle');
+      taskCheckboxes.forEach(cb => {
+        if (tasksFromModal.includes(cb.value)) {
+          cb.checked = true;
+          // Trigger change event to show task detail cards
+          cb.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      });
+      
+      // Update task assignee dropdowns after showing cards
+      updateTaskAssigneeDropdowns();
+      
+      // Apply pattern-based assignee suggestions (only if checked) - delay to ensure cards exist
+      setTimeout(() => {
+        let debugLog = 'DEBUG: Applying task assignees...\n';
+        debugLog += `DEBUG: taskAssigneesMap: ${JSON.stringify([...taskAssigneesMap.entries()])}\n`;
+        debugLog += `DEBUG: tasksFromModal: ${JSON.stringify(tasksFromModal)}\n`;
+        
+        tasksFromModal.forEach(taskName => {
+          const selectedAssigneesForTask = taskAssigneesMap.get(taskName) || [];
+          const suggestedAssignee = selectedAssigneesForTask.length > 0 ? selectedAssigneesForTask[0] : null;
+          
+          debugLog += `DEBUG: Task "${taskName}" -> suggested assignee: "${suggestedAssignee}"\n`;
+          
+          if (suggestedAssignee) {
+            // Find the task card for this task
+            const taskCard = document.querySelector(`#taskCards .task-card[data-task="${taskName}"]`);
+            debugLog += `DEBUG: Found task card for "${taskName}": ${!!taskCard}\n`;
+            
+            if (taskCard) {
+              const assigneeSelect = taskCard.querySelector('.task-assignee-select');
+              debugLog += `DEBUG: Found assignee select: ${!!assigneeSelect}\n`;
+              
+              if (assigneeSelect) {
+                const options = Array.from(assigneeSelect.options).map(opt => opt.value);
+                debugLog += `DEBUG: Dropdown options: ${JSON.stringify(options)}\n`;
+                
+                // Check if the suggested assignee is in the dropdown
+                const option = Array.from(assigneeSelect.options).find(opt => opt.value === suggestedAssignee);
+                debugLog += `DEBUG: Found matching option for "${suggestedAssignee}": ${!!option}\n`;
+                
+                if (option) {
+                  assigneeSelect.value = suggestedAssignee;
+                  debugLog += `DEBUG: Set assignee to "${suggestedAssignee}"\n`;
+                  // Add a visual indicator that this was auto-suggested
+                  assigneeSelect.style.backgroundColor = '#f0f9ff';
+                  assigneeSelect.title = `Auto-suggested based on pattern: ${taskName} → ${suggestedAssignee}`;
+                }
+              }
+            }
+          }
+        });
+        
+        // Show debug in task pane
+        const debugDiv = document.createElement('div');
+        debugDiv.style.cssText = 'position:fixed;top:10px;right:10px;background:#f0f0f0;padding:10px;border:1px solid #ccc;z-index:10000;max-width:400px;white-space:pre-wrap;font-family:monospace;font-size:11px;';
+        debugDiv.textContent = debugLog;
+        document.body.appendChild(debugDiv);
+        setTimeout(() => debugDiv.remove(), 10000);
+      }, 100);
+      
+      // Set all task statuses to "To Do" by default
+      document.querySelectorAll('#taskCards .task-card').forEach(card => {
+        const statusChips = card.querySelectorAll('.chip[data-value="To Do"]');
+        if (statusChips.length > 0) {
+          // Clear any existing selection
+          card.querySelectorAll('.chip').forEach(chip => chip.classList.remove('active'));
+          // Select "To Do"
+          statusChips.forEach(chip => chip.classList.add('active'));
+        }
+      });
+      
+      appliedItems.push(`Tasks: ${tasksFromModal.join(', ')}`);
+    }
+
+    
+    // Check for important fields that might still be empty BEFORE applying
+    const missingFields = [];
+    
+    // Check dates
+    if (initialRequestInput && !initialRequestInput.value) missingFields.push('Initial Request Date');
+    if (remindersStartInput && !remindersStartInput.value) missingFields.push('Reminders Start Date');
+    
+    // Check broker lead
+    if (brokerLeadEl && !brokerLeadEl.value) missingFields.push('Broker Lead');
+    
+    // Check email frequency
+    const emailFrequencyEl = qs('#emailFrequency');
+    if (emailFrequencyEl) {
+      const isEmpty = emailFrequencyEl.tagName === 'SELECT' 
+        ? emailFrequencyEl.selectedIndex <= 0 || !emailFrequencyEl.value
+        : !emailFrequencyEl.value || emailFrequencyEl.value.trim() === '';
+      
+      if (isEmpty) {
+        missingFields.push('Email Frequency');
       }
     }
+    
+    // Check if any tasks are selected
+    const selectedTasks = document.querySelectorAll('#tasksChecklist .task-toggle:checked');
+    if (selectedTasks.length === 0) missingFields.push('Task Selection');
+    
+    // Check if any assignees are selected
+    const selectedAssigneeElements = document.querySelectorAll('#assignees input[type=checkbox]:checked');
+    if (selectedAssigneeElements.length === 0) missingFields.push('Assignees');
 
     // Mark form as having unsaved changes
     if (appliedItems.length > 0) {
       setUnsavedChanges(true);
-      showToast(`✨ Applied: ${appliedItems.join(', ')}`, 'success');
+      
+      // Build message AFTER checking missing fields
+      let message = '';
+      if (missingFields.length > 0) {
+        message = `⚠️ Still needed: ${missingFields.join(', ')}. `;
+      }
+      message += `✨ Applied to form - Click "Save Changes" to confirm!`;
+      
+      showToast(message, 'success', 10000); // Show for 10 seconds
+      
+      // Highlight the save button to draw attention
+      const saveBtn = document.getElementById('saveBtn');
+      if (saveBtn) {
+        saveBtn.style.animation = 'pulse 2s ease-in-out 3';
+        setTimeout(() => {
+          saveBtn.style.animation = '';
+        }, 6000);
+      }
     } else {
       showToast('No items selected', 'info');
     }
@@ -3022,7 +3488,8 @@
           wireDateInputs();
           wireDeadlineInputs(); // Wire deadline warnings
           wireChangeTracking(); // Track unsaved changes
-        // Wire task checkbox visibility
+          
+                  // Wire task checkbox visibility
         qsa('#tasksChecklist .task-toggle').forEach(cb => {
           cb.addEventListener('change', () => syncTasksVisibility());
         });
@@ -3033,6 +3500,9 @@
         loadFromActiveRow().then(() => {
           // Reset unsaved indicator after initial load
           setUnsavedChanges(false);
+          
+          // Build task-assignee patterns from existing data
+          buildTaskAssigneePatterns();
           // Auto-load active tasks on startup
           performSearch();
         });
